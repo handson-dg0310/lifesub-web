@@ -135,6 +135,7 @@ podTemplate(
                 """
             }
 
+            // apply
             container('azure-cli') {
                 sh """
                     # ACR 인증 시크릿 생성
