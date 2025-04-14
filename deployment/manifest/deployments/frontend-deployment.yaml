@@ -31,9 +31,9 @@ spec:
         - name: runtime-config
           mountPath: /usr/share/nginx/html/runtime-env.js
           subPath: runtime-env.js
+      imagePullSecrets:
+      - name: acr-auth
       volumes:
       - name: runtime-config
         configMap:
-          name: frontend-config
-      imagePullSecrets:
-      - name: acr-secret
+          name: frontend-runtime-config
