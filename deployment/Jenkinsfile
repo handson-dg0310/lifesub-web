@@ -10,15 +10,15 @@ podTemplate(
     label: "${PIPELINE_ID}",
     serviceAccount: 'jenkins',
     containers: [
-        containerTemplate(name: 'nodejs', image: 'node:20-slim', command: 'cat', ttyEnabled: true),
+        containerTemplate(name: 'node', image: 'node:20-slim', ttyEnabled: true, command: 'cat'),
         containerTemplate(name: 'podman', image: "mgoltzsche/podman", ttyEnabled: true, command: 'cat', privileged: true),
-        containerTemplate(name: 'azure-cli', image: 'mcr.microsoft.com/azure-cli:latest', command: 'cat', ttyEnabled: true),
-        containerTemplate(name: 'envsubst', image: "mikefarah/yq", command: 'sleep', args: '1h')
+        containerTemplate(name: 'azure-cli', image: 'hiondal/azure-kubectl:latest', command: 'cat', ttyEnabled: true),
+        containerTemplate(name: 'envsubst', image: "hiondal/envsubst", command: 'sleep', args: '1h'),
+        containerTemplate(name: 'sonar-scanner', image: 'sonarsource/sonar-scanner-cli:latest', command: 'cat', ttyEnabled: true)
     ],
     volumes: [
-        emptyDirVolume(mountPath: '/home/node/.npm', memory: false),
         emptyDirVolume(mountPath: '/root/.azure', memory: false),
-        emptyDirVolume(mountPath: '/run/podman', memory: false)
+        emptyDirVolume(mountPath: '/opt/sonar-scanner/.sonar/cache', memory: false)
     ]
 ) {
     node(PIPELINE_ID) {
@@ -26,15 +26,40 @@ podTemplate(
         def imageTag = getImageTag()
         def manifest = "deploy.yaml"
         def namespace
-        def appName
-        def ingressHost
+        def sonarScannerHome = '/opt/sonar-scanner'
 
         stage("Get Source") {
             checkout scm
             props = readProperties file: "deployment/deploy_env_vars"
             namespace = "${props.namespace}"
-            appName = "${props.app_name}"
-            ingressHost = "${props.ingress_host}"
+        }
+
+        stage('Code Analysis & Quality Gate') {
+            container('node') {
+                sh "npm install"
+                sh "npm test -- --coverage --passWithNoTests"
+            }
+            
+            container('sonar-scanner') {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        ${sonarScannerHome}/bin/sonar-scanner \
+                        -Dsonar.projectKey=lifesub-web-dg0310 \
+                        -Dsonar.projectName=lifesub-web-dg0310 \
+                        -Dsonar.sources=src \
+                        -Dsonar.tests=src \
+                        -Dsonar.test.inclusions=src/**/*.test.js,src/**/*.test.jsx \
+                        -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+                    """
+                }
+            }
+            
+            timeout(time: 10, unit: 'MINUTES') {
+                def qg = waitForQualityGate()
+                if (qg.status != 'OK') {
+                    error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                }
+            }
         }
 
         stage("Setup AKS") {
@@ -49,61 +74,26 @@ podTemplate(
             }
         }
 
-        stage('Build Application & SonarQube Analysis') {
-            container('nodejs') {
-                // 빌드 전 설치
-                sh 'npm ci'
-                
-                // 테스트 및 빌드 실행
-                sh 'npm test'
-                sh 'npm run build'
-                
-                // SonarQube 분석
-                withSonarQubeEnv('SonarQube') {
-                    sh """
-                        npx sonar-scanner \
-                          -Dsonar.projectKey=lifesub-web-dg0310 \
-                          -Dsonar.projectName=lifesub-web-dg0310 \
-                          -Dsonar.sources=src \
-                          -Dsonar.tests=src \
-                          -Dsonar.test.inclusions=**/*.test.js,**/*.test.jsx,**/*.test.ts,**/*.test.tsx \
-                          -Dsonar.exclusions=**/*.test.js,**/*.test.jsx,**/*.test.ts,**/*.test.tsx,**/node_modules/**,**/coverage/** \
-                          -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
-                    """
-                }
-            }
-        }
-
-        stage('Quality Gate') {
-            timeout(time: 10, unit: 'MINUTES') {
-                def qg = waitForQualityGate()
-                if (qg.status != 'OK') {
-                    error "Pipeline aborted due to quality gate failure: ${qg.status}"
-                }
-            }
-        }
-
         stage('Build & Push Image') {
             container('podman') {
-                sh 'podman system service -t 0 unix:///run/podman/podman.sock & sleep 2'
-                
                 withCredentials([usernamePassword(
                     credentialsId: 'acr-credentials',
                     usernameVariable: 'USERNAME',
                     passwordVariable: 'PASSWORD'
                 )]) {
-                    sh "podman login ${props.registry} --username \$USERNAME --password \$PASSWORD"
+                    def imagePath = "${props.registry}/${props.image_org}/${props.service_name}:${imageTag}"
                     
-                    // 이미지 빌드 및 푸시
                     sh """
+                        podman login ${props.registry} --username \$USERNAME --password \$PASSWORD
+
                         podman build \
-                            --build-arg PROJECT_FOLDER=. \
-                            --build-arg BUILD_FOLDER=${props.BUILD_FOLDER} \
-                            --build-arg EXPORT_PORT=${props.export_port} \
+                            --build-arg PROJECT_FOLDER="." \
+                            --build-arg BUILD_FOLDER="deployment/container" \
+                            --build-arg EXPORT_PORT="${props.export_port}" \
                             -f deployment/container/Dockerfile-lifesub-web \
-                            -t ${props.registry}/${props.image_org}/${props.app_name}:${imageTag} .
+                            -t ${imagePath} .
                         
-                        podman push ${props.registry}/${props.image_org}/${props.app_name}:${imageTag}
+                        podman push ${imagePath}
                     """
                 }
             }
@@ -111,62 +101,40 @@ podTemplate(
 
         stage('Generate & Apply Manifest') {
             container('envsubst') {
-                // envsubst 대체 값들 설정
                 sh """
                     export namespace=${namespace}
-                    export app_name=${appName}
+                    export service_name=${props.service_name}
+                    export lifesub_web_image_path=${props.registry}/${props.image_org}/${props.service_name}:${imageTag}
                     export replicas=${props.replicas}
-                    export registry=${props.registry}
-                    export image_org=${props.image_org}
-                    export image_tag=${imageTag}
                     export export_port=${props.export_port}
-                    export ingress_host=${ingressHost}
+                    export ingress_host=${props.ingress_host}
                     export resources_requests_cpu=${props.resources_requests_cpu}
                     export resources_requests_memory=${props.resources_requests_memory}
                     export resources_limits_cpu=${props.resources_limits_cpu}
                     export resources_limits_memory=${props.resources_limits_memory}
-
-                    # manifest 생성
-                    envsubst < deployment/${manifest}.template > deployment/${manifest}
                     
-                    # 디버깅을 위해 생성된 manifest 출력
-                    echo "생성된 manifest 파일:"
+                    envsubst < deployment/${manifest}.template > deployment/${manifest}
+                    echo "Generated manifest file:"
                     cat deployment/${manifest}
                 """
             }
 
-            // apply
             container('azure-cli') {
                 sh """
-                    # ACR 인증 시크릿 생성
-                    kubectl create secret docker-registry acr-auth \
-                        --docker-server=${props.registry} \
-                        --docker-username=\$DOCKER_USERNAME \
-                        --docker-password=\$DOCKER_PASSWORD \
-                        --namespace=${namespace} \
-                        --dry-run=client -o yaml | kubectl apply -f -
-                        
-                    # manifest 적용
                     kubectl apply -f deployment/${manifest}
                     
-                    # 배포 상태 확인
                     echo "Waiting for deployment to be ready..."
-                    kubectl -n ${namespace} wait --for=condition=available deployment/${appName} --timeout=300s
+                    kubectl -n ${namespace} wait --for=condition=available deployment/${props.service_name} --timeout=300s
                     
-                    # 서비스 External IP 확인
-                    echo "Waiting for External IP..."
-                    
-                    # External IP가 할당될 때까지 기다림
-                    EXTERNAL_IP=""
-                    while [ -z "\$EXTERNAL_IP" ]; do
-                        EXTERNAL_IP=\$(kubectl get service ${appName} -n ${namespace} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-                        if [ -z "\$EXTERNAL_IP" ]; then
-                            echo "Waiting for External IP to be assigned..."
-                            sleep 10
-                        fi
+                    echo "Waiting for service external IP..."
+                    while [[ -z \$(kubectl -n ${namespace} get svc ${props.service_name} -o jsonpath='{.status.loadBalancer.ingress[0].ip}') ]]; do
+                        echo "Still waiting for external IP..."
+                        sleep 5
                     done
                     
-                    echo "Service deployed successfully! External IP: \$EXTERNAL_IP"
+                    EXTERNAL_IP=\$(kubectl -n ${namespace} get svc ${props.service_name} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+                    echo "Service successfully deployed with external IP: \$EXTERNAL_IP"
+                    echo "Application is accessible at: http://\$EXTERNAL_IP"
                 """
             }
         }
