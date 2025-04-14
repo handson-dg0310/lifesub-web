@@ -1,0 +1,72 @@
+apiVersion: v1
+data:
+  runtime-env.js: |
+    window.__runtime_config__ = {
+      MEMBER_URL: 'http://${ingress_host}/api/auth',
+      MYSUB_URL: 'http://${ingress_host}/api/mysub',
+      RECOMMEND_URL: 'http://${ingress_host}/api/recommend'
+    };
+kind: ConfigMap
+metadata:
+  name: frontend-runtime-config
+  namespace: ${namespace}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: ${app_name}
+  name: ${app_name}
+  namespace: ${namespace}
+spec:
+  replicas: ${replicas}
+  selector:
+    matchLabels:
+      app: ${app_name}
+  template:
+    metadata:
+      labels:
+        app: ${app_name}
+    spec:
+      containers:
+      - image: ${registry}/${image_org}/${app_name}:${image_tag}
+        imagePullPolicy: Always
+        name: ${app_name}
+        ports:
+        - containerPort: ${export_port}
+        resources:
+          limits:
+            cpu: ${resources_limits_cpu}
+            memory: ${resources_limits_memory}
+          requests:
+            cpu: ${resources_requests_cpu}
+            memory: ${resources_requests_memory}
+        volumeMounts:
+        - mountPath: /usr/share/nginx/html/runtime-env.js
+          name: runtime-config
+          subPath: runtime-env.js
+      imagePullSecrets:
+      - name: acr-auth
+      volumes:
+      - configMap:
+          name: frontend-runtime-config
+        name: runtime-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: ${app_name}
+  name: ${app_name}
+  namespace: ${namespace}
+spec:
+  ports:
+  - name: http
+    port: 80
+    protocol: TCP
+    targetPort: ${export_port}
+  selector:
+    app: ${app_name}
+  type: LoadBalancer
